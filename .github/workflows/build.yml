@@ -6,7 +6,7 @@ on:
 permissions:
   contents: write
 
-# Prevent two manual runs from deleting/creating the same date-tag concurrently.
+# Serialize manual runs so two runs cannot replace the same date tag concurrently.
 concurrency:
   group: fairplay-decrypt-manual-release
   cancel-in-progress: false
@@ -39,7 +39,7 @@ jobs:
         run: echo "version=$(TZ=Asia/Kolkata date +'%d.%m.%y')" >> "$GITHUB_OUTPUT"
 
   build-linux:
-    name: Build Linux decryptor helper and stage source
+    name: Build Linux decryptor helper and archive source
     runs-on: ubuntu-latest
     needs: resolve-upstream
     steps:
@@ -52,42 +52,49 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install Python requirements in a temporary venv and build for Linux
+      - name: Install native build tools
         shell: bash
         run: |
           set -euo pipefail
-          python -m venv upstream/.venv
-          upstream/.venv/bin/python -m pip install --upgrade pip
-          upstream/.venv/bin/python -m pip install -r upstream/requirements.txt
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential file tar
+
+      - name: Build transform using the repository Makefile
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The root Makefile's `transform` target is a plain C build; no Python
+          # venv or pip packages are required to compile it.
           make -C upstream transform
+          test -s upstream/transform
           test -x upstream/transform
           file upstream/transform
 
-      - name: Remove runner-only files from the release source
+      - name: Clean runner-only files and archive the source tree
         shell: bash
         run: |
           set -euo pipefail
-          # Remove every path component named .venv, regardless of whether it is
-          # a directory, symlink, or file, including nested environments.
-          find upstream -name .venv -prune -exec rm -rf -- {} +
-          rm -rf upstream/.git upstream/credential-retrieval/build
-          find upstream -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf -- {} +
+
+          # A venv should not be created by this workflow. If one appears due to
+          # a future change or source content, warn and remove it rather than fail.
           if find upstream -name .venv -print -quit | grep -q .; then
-            echo 'A virtual environment would leak into the release package.' >&2
-            exit 1
+            echo "::warning::Found a .venv path in the Linux staging tree; removing it before packaging."
+            find upstream -name .venv -prune -exec rm -rf -- {} +
           fi
 
-      - name: Upload source tree with Linux helper
+          rm -rf upstream/.git upstream/credential-retrieval/build
+          find upstream -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf -- {} +
+
+          # GitHub's artifact ZIP transport normalizes file modes. Put the tree
+          # in a tarball first so transform remains executable after transfer.
+          tar -C upstream -cf linux-source.tar .
+          tar -tf linux-source.tar | sed -n '1,80p'
+
+      - name: Upload Linux source and transform TAR
         uses: actions/upload-artifact@v4
         with:
-          name: linux-source
-          path: upstream/
-          include-hidden-files: true
+          name: linux-source-tar
+          path: linux-source.tar
           if-no-files-found: error
           retention-days: 1
 
@@ -109,29 +116,38 @@ jobs:
         shell: bash
         run: brew list --formula ldid >/dev/null 2>&1 || brew install ldid
 
-      - name: Build iOS credential-retrieval bundle
+      - name: Build iOS credential-retrieval bundle with upstream Makefile
         shell: bash
         run: |
           set -euo pipefail
           make -C upstream/credential-retrieval bundle
+
           bundle='upstream/credential-retrieval/build/bundle'
           for item in credential.ios driver.ios trigger.ios static-key-table.bin core4-word-table.bin; do
-            test -s "$bundle/$item"
+            if [[ ! -s "$bundle/$item" ]]; then
+              echo "::error::Upstream Makefile did not produce $bundle/$item"
+              echo 'Bundle directory contents:'
+              find upstream/credential-retrieval/build -maxdepth 4 -print 2>/dev/null || true
+              exit 1
+            fi
           done
 
-      - name: Stage only the generated credential bundle
+          file "$bundle/credential.ios" "$bundle/driver.ios" "$bundle/trigger.ios"
+
+      - name: Stage bundle and archive it with file modes preserved
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p payload/credential-retrieval/build
           cp -a upstream/credential-retrieval/build/bundle payload/credential-retrieval/build/
+          tar -C payload -cf ios-credential-bundle.tar .
+          tar -tf ios-credential-bundle.tar
 
-      - name: Upload iOS credential bundle
+      - name: Upload iOS credential bundle TAR
         uses: actions/upload-artifact@v4
         with:
-          name: ios-credential-bundle
-          path: payload/
-          include-hidden-files: true
+          name: ios-credential-bundle-tar
+          path: ios-credential-bundle.tar
           if-no-files-found: error
           retention-days: 1
 
@@ -140,19 +156,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: [resolve-upstream, build-linux, build-ios]
     steps:
-      - name: Download Linux source and helper
+      - name: Download Linux source and iOS bundle TARs
         uses: actions/download-artifact@v4
         with:
-          name: linux-source
-          path: dist/fairplay-decrypt-${{ needs.resolve-upstream.outputs.version }}
+          pattern: '*-tar'
+          path: dist/artifacts
+          merge-multiple: true
 
-      - name: Merge iOS credential bundle into source tree
-        uses: actions/download-artifact@v4
-        with:
-          name: ios-credential-bundle
-          path: dist/fairplay-decrypt-${{ needs.resolve-upstream.outputs.version }}
-
-      - name: Create release ZIP and verify contents
+      - name: Create release ZIP and validate its actual contents
         id: package
         shell: bash
         env:
@@ -162,21 +173,45 @@ jobs:
           set -euo pipefail
           payload="dist/fairplay-decrypt-${VERSION}"
           zip_path="dist/fairplay-decrypt-${VERSION}.zip"
+          entries_file="$RUNNER_TEMP/fairplay-decrypt-zip-entries.txt"
 
-          test -x "$payload/transform"
-          for item in credential.ios driver.ios trigger.ios static-key-table.bin core4-word-table.bin; do
-            test -s "$payload/credential-retrieval/build/bundle/$item"
-          done
+          mkdir -p "$payload"
+          test -s dist/artifacts/linux-source.tar
+          test -s dist/artifacts/ios-credential-bundle.tar
+          tar -xf dist/artifacts/linux-source.tar -C "$payload"
+          tar -xf dist/artifacts/ios-credential-bundle.tar -C "$payload"
 
-          # Sanitize again after both artifacts have been merged. Find entries
-          # by name without -type d so symlinks/files named .venv are removed too.
-          find "$payload" -name .venv -prune -exec rm -rf -- {} +
-          find "$payload" -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf -- {} +
-          if find "$payload" -name .venv -print -quit | grep -q .; then
-            echo 'Refusing to publish: a .venv path remains in the staged payload.' >&2
-            find "$payload" -name .venv -print >&2 || true
+          # Confirm the repository layout before archiving, with useful listing
+          # output if an upstream Makefile changes its output directory.
+          if [[ ! -s "$payload/transform" ]]; then
+            echo "::error::Missing Linux helper at $payload/transform"
+            find "$payload" -maxdepth 4 -type f -print | sort
             exit 1
           fi
+          if [[ ! -x "$payload/transform" ]]; then
+            echo "::error::transform lost its executable bit during artifact transfer"
+            ls -l "$payload/transform"
+            exit 1
+          fi
+
+          bundle="$payload/credential-retrieval/build/bundle"
+          for item in credential.ios driver.ios trigger.ios static-key-table.bin core4-word-table.bin; do
+            if [[ ! -s "$bundle/$item" ]]; then
+              echo "::error::Missing expected upstream bundle output: $bundle/$item"
+              echo 'Credential-retrieval build tree:'
+              find "$payload/credential-retrieval" -maxdepth 6 -print 2>/dev/null | sort || true
+              exit 1
+            fi
+          done
+
+          # Don't let a runner-created venv ship in the release. Its presence is
+          # a warning, not a fatal error; remove it before making the ZIP.
+          if find "$payload" -name .venv -print -quit | grep -q .; then
+            echo "::warning::Found a .venv path in the merged payload; removing it before creating the release ZIP."
+            find "$payload" -name .venv -prune -exec rm -rf -- {} +
+          fi
+          find "$payload" -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf -- {} +
+          rm -rf "$payload/.git"
 
           cat > "$payload/BUILD-INFO.txt" <<EOF
           Upstream: https://github.com/EthanArbuckle/fairplay-decrypt
@@ -185,23 +220,52 @@ jobs:
           Release version: ${VERSION}
           Version date timezone: Asia/Kolkata
 
-          transform: Linux host executable built on ubuntu-latest
-          credential-retrieval/build/bundle/: iOS ARM64 device programs and required data tables built with Xcode on macos-latest
+          transform: Linux executable built with the upstream root Makefile on ubuntu-latest.
+          credential-retrieval/build/bundle/: iOS ARM64 programs and data tables built with the upstream credential-retrieval Makefile on macos-latest.
 
-          Source is included. The runner-only Python virtual environment and Git metadata are excluded.
+          Includes the upstream source tree. Runner-created virtual environments and Git metadata are excluded.
           EOF
 
-          # Keep a second exclusion barrier in the ZIP command itself in case
-          # a future staging change accidentally reintroduces a venv.
-          (cd dist && zip -qr "fairplay-decrypt-${VERSION}.zip" "fairplay-decrypt-${VERSION}" \
-            -x '*/.venv' '*/.venv/*' '*/.venv/**')
+          mkdir -p dist
+          rm -f "$zip_path"
+          (cd dist && zip -qr "$(basename "$zip_path")" "$(basename "$payload")" \
+            -x '*/.venv' '*/.venv/*' '*/.venv/**' \
+               '*/__pycache__/*' '*/.pytest_cache/*')
           test -s "$zip_path"
-          unzip -Z1 "$zip_path" | grep -F "/transform" >/dev/null
-          unzip -Z1 "$zip_path" | grep -F "/credential-retrieval/build/bundle/credential.ios" >/dev/null
-          if unzip -Z1 "$zip_path" | grep -E '(^|/)\.venv(/|$)' >/dev/null; then
-            echo 'The ZIP unexpectedly contains a virtual environment.' >&2
-            exit 1
+          unzip -Z1 "$zip_path" > "$entries_file"
+
+          # Match path suffixes instead of requiring a specific ZIP root prefix.
+          # This accepts either `transform` or `<release-root>/transform`, and
+          # remains diagnostic if download/packaging layout changes again.
+          require_zip_entry() {
+            local pattern="$1"
+            local label="$2"
+            if ! grep -Eq "$pattern" "$entries_file"; then
+              echo "::error::Release ZIP is missing required entry: $label"
+              echo 'ZIP entries relevant to the build outputs:'
+              grep -E '(^|/)(transform|credential-retrieval/build/bundle/[^/]+)$' "$entries_file" || true
+              echo 'First 160 ZIP entries:'
+              sed -n '1,160p' "$entries_file"
+              exit 1
+            fi
+          }
+
+          require_zip_entry '(^|/)transform$' 'transform'
+          require_zip_entry '(^|/)credential-retrieval/build/bundle/credential[.]ios$' 'credential-retrieval/build/bundle/credential.ios'
+          require_zip_entry '(^|/)credential-retrieval/build/bundle/driver[.]ios$' 'credential-retrieval/build/bundle/driver.ios'
+          require_zip_entry '(^|/)credential-retrieval/build/bundle/trigger[.]ios$' 'credential-retrieval/build/bundle/trigger.ios'
+          require_zip_entry '(^|/)credential-retrieval/build/bundle/static-key-table[.]bin$' 'credential-retrieval/build/bundle/static-key-table.bin'
+          require_zip_entry '(^|/)credential-retrieval/build/bundle/core4-word-table[.]bin$' 'credential-retrieval/build/bundle/core4-word-table.bin'
+
+          # A residual venv entry should never abort the release. Exclusions
+          # normally remove it; if one slips through, surface a warning only.
+          if grep -Eq '(^|/)\.venv(/|$)' "$entries_file"; then
+            echo "::warning::The release ZIP contains a .venv path despite cleanup/exclusions; publishing continues by request."
+            grep -E '(^|/)\.venv(/|$)' "$entries_file" | sed -n '1,30p' || true
           fi
+
+          echo 'Verified release ZIP entries:'
+          grep -E '(^|/)(transform|credential-retrieval/build/bundle/[^/]+)$' "$entries_file" || true
           echo "zip_path=$zip_path" >> "$GITHUB_OUTPUT"
 
       - name: Replace existing release/tag and publish ZIP
@@ -226,7 +290,7 @@ jobs:
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
           Automated build of [EthanArbuckle/fairplay-decrypt](https://github.com/EthanArbuckle/fairplay-decrypt) at commit [\`${UPSTREAM_SHA}\`](https://github.com/EthanArbuckle/fairplay-decrypt/commit/${UPSTREAM_SHA}).
 
-          The ZIP contains the source tree, the Linux-built \`transform\` helper, and the Xcode-built iOS ARM64 credential-retrieval bundle. The runner-created Python virtual environment and Git metadata are excluded.
+          The ZIP contains the source tree, the Linux-built \`transform\` helper, and the Xcode-built iOS ARM64 credential-retrieval bundle. Runner-created Python virtual environments and Git metadata are excluded.
           EOF
 
           gh release create "$VERSION" \
