@@ -1,4 +1,4 @@
-name: Build and release fairdecrypt
+name: Build and release fairplay-decrypt
 
 on:
   workflow_dispatch:
@@ -72,9 +72,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf upstream/.venv upstream/.git upstream/credential-retrieval/build
-          find upstream -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf {} +
-          if find upstream -type d -name .venv -print -quit | grep -q .; then
+          # Remove every path component named .venv, regardless of whether it is
+          # a directory, symlink, or file, including nested environments.
+          find upstream -name .venv -prune -exec rm -rf -- {} +
+          rm -rf upstream/.git upstream/credential-retrieval/build
+          find upstream -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf -- {} +
+          if find upstream -name .venv -print -quit | grep -q .; then
             echo 'A virtual environment would leak into the release package.' >&2
             exit 1
           fi
@@ -165,8 +168,13 @@ jobs:
             test -s "$payload/credential-retrieval/build/bundle/$item"
           done
 
-          if find "$payload" -type d -name .venv -print -quit | grep -q .; then
-            echo 'Refusing to publish a ZIP containing a .venv directory.' >&2
+          # Sanitize again after both artifacts have been merged. Find entries
+          # by name without -type d so symlinks/files named .venv are removed too.
+          find "$payload" -name .venv -prune -exec rm -rf -- {} +
+          find "$payload" -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf -- {} +
+          if find "$payload" -name .venv -print -quit | grep -q .; then
+            echo 'Refusing to publish: a .venv path remains in the staged payload.' >&2
+            find "$payload" -name .venv -print >&2 || true
             exit 1
           fi
 
@@ -183,7 +191,10 @@ jobs:
           Source is included. The runner-only Python virtual environment and Git metadata are excluded.
           EOF
 
-          (cd dist && zip -qr "fairplay-decrypt-${VERSION}.zip" "fairplay-decrypt-${VERSION}")
+          # Keep a second exclusion barrier in the ZIP command itself in case
+          # a future staging change accidentally reintroduces a venv.
+          (cd dist && zip -qr "fairplay-decrypt-${VERSION}.zip" "fairplay-decrypt-${VERSION}" \
+            -x '*/.venv' '*/.venv/*' '*/.venv/**')
           test -s "$zip_path"
           unzip -Z1 "$zip_path" | grep -F "/transform" >/dev/null
           unzip -Z1 "$zip_path" | grep -F "/credential-retrieval/build/bundle/credential.ios" >/dev/null
