@@ -1,0 +1,226 @@
+name: Build and release fairdecrypt
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Prevent two manual runs from deleting/creating the same date-tag concurrently.
+concurrency:
+  group: fairplay-decrypt-manual-release
+  cancel-in-progress: false
+
+jobs:
+  resolve-upstream:
+    name: Resolve upstream revision and release version
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_sha: ${{ steps.source.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Fetch latest upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: EthanArbuckle/fairplay-decrypt
+          ref: main
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve upstream commit
+        id: source
+        shell: bash
+        run: echo "sha=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Generate dd.mm.yy release version
+        id: version
+        shell: bash
+        run: echo "version=$(TZ=Asia/Kolkata date +'%d.%m.%y')" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    name: Build Linux decryptor helper and stage source
+    runs-on: ubuntu-latest
+    needs: resolve-upstream
+    steps:
+      - name: Checkout pinned upstream revision
+        uses: actions/checkout@v4
+        with:
+          repository: EthanArbuckle/fairplay-decrypt
+          ref: ${{ needs.resolve-upstream.outputs.upstream_sha }}
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python requirements in a temporary venv and build for Linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv upstream/.venv
+          upstream/.venv/bin/python -m pip install --upgrade pip
+          upstream/.venv/bin/python -m pip install -r upstream/requirements.txt
+          make -C upstream transform
+          test -x upstream/transform
+          file upstream/transform
+
+      - name: Remove runner-only files from the release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf upstream/.venv upstream/.git upstream/credential-retrieval/build
+          find upstream -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf {} +
+          if find upstream -type d -name .venv -print -quit | grep -q .; then
+            echo 'A virtual environment would leak into the release package.' >&2
+            exit 1
+          fi
+
+      - name: Upload source tree with Linux helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-source
+          path: upstream/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  build-ios:
+    name: Cross-compile iOS credential-retrieval bundle
+    runs-on: macos-latest
+    needs: resolve-upstream
+    steps:
+      - name: Checkout pinned upstream revision
+        uses: actions/checkout@v4
+        with:
+          repository: EthanArbuckle/fairplay-decrypt
+          ref: ${{ needs.resolve-upstream.outputs.upstream_sha }}
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install ldid
+        shell: bash
+        run: brew list --formula ldid >/dev/null 2>&1 || brew install ldid
+
+      - name: Build iOS credential-retrieval bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C upstream/credential-retrieval bundle
+          bundle='upstream/credential-retrieval/build/bundle'
+          for item in credential.ios driver.ios trigger.ios static-key-table.bin core4-word-table.bin; do
+            test -s "$bundle/$item"
+          done
+
+      - name: Stage only the generated credential bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p payload/credential-retrieval/build
+          cp -a upstream/credential-retrieval/build/bundle payload/credential-retrieval/build/
+
+      - name: Upload iOS credential bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-credential-bundle
+          path: payload/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Package ZIP and replace date-matched release
+    runs-on: ubuntu-latest
+    needs: [resolve-upstream, build-linux, build-ios]
+    steps:
+      - name: Download Linux source and helper
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-source
+          path: dist/fairplay-decrypt-${{ needs.resolve-upstream.outputs.version }}
+
+      - name: Merge iOS credential bundle into source tree
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-credential-bundle
+          path: dist/fairplay-decrypt-${{ needs.resolve-upstream.outputs.version }}
+
+      - name: Create release ZIP and verify contents
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve-upstream.outputs.version }}
+          UPSTREAM_SHA: ${{ needs.resolve-upstream.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          payload="dist/fairplay-decrypt-${VERSION}"
+          zip_path="dist/fairplay-decrypt-${VERSION}.zip"
+
+          test -x "$payload/transform"
+          for item in credential.ios driver.ios trigger.ios static-key-table.bin core4-word-table.bin; do
+            test -s "$payload/credential-retrieval/build/bundle/$item"
+          done
+
+          if find "$payload" -type d -name .venv -print -quit | grep -q .; then
+            echo 'Refusing to publish a ZIP containing a .venv directory.' >&2
+            exit 1
+          fi
+
+          cat > "$payload/BUILD-INFO.txt" <<EOF
+          Upstream: https://github.com/EthanArbuckle/fairplay-decrypt
+          Upstream commit: ${UPSTREAM_SHA}
+          Upstream commit URL: https://github.com/EthanArbuckle/fairplay-decrypt/commit/${UPSTREAM_SHA}
+          Release version: ${VERSION}
+          Version date timezone: Asia/Kolkata
+
+          transform: Linux host executable built on ubuntu-latest
+          credential-retrieval/build/bundle/: iOS ARM64 device programs and required data tables built with Xcode on macos-latest
+
+          Source is included. The runner-only Python virtual environment and Git metadata are excluded.
+          EOF
+
+          (cd dist && zip -qr "fairplay-decrypt-${VERSION}.zip" "fairplay-decrypt-${VERSION}")
+          test -s "$zip_path"
+          unzip -Z1 "$zip_path" | grep -F "/transform" >/dev/null
+          unzip -Z1 "$zip_path" | grep -F "/credential-retrieval/build/bundle/credential.ios" >/dev/null
+          if unzip -Z1 "$zip_path" | grep -E '(^|/)\.venv(/|$)' >/dev/null; then
+            echo 'The ZIP unexpectedly contains a virtual environment.' >&2
+            exit 1
+          fi
+          echo "zip_path=$zip_path" >> "$GITHUB_OUTPUT"
+
+      - name: Replace existing release/tag and publish ZIP
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.resolve-upstream.outputs.version }}
+          UPSTREAM_SHA: ${{ needs.resolve-upstream.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          release_api="repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}"
+          tag_api="repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}"
+
+          if gh api "$release_api" >/dev/null 2>&1; then
+            echo "Deleting existing release ${VERSION} and its tag."
+            gh release delete "$VERSION" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          elif gh api "$tag_api" >/dev/null 2>&1; then
+            echo "Deleting orphaned tag ${VERSION}."
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}"
+          fi
+
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Automated build of [EthanArbuckle/fairplay-decrypt](https://github.com/EthanArbuckle/fairplay-decrypt) at commit [\`${UPSTREAM_SHA}\`](https://github.com/EthanArbuckle/fairplay-decrypt/commit/${UPSTREAM_SHA}).
+
+          The ZIP contains the source tree, the Linux-built \`transform\` helper, and the Xcode-built iOS ARM64 credential-retrieval bundle. The runner-created Python virtual environment and Git metadata are excluded.
+          EOF
+
+          gh release create "$VERSION" \
+            "dist/fairplay-decrypt-${VERSION}.zip" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --target "$GITHUB_SHA"
